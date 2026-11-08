@@ -1,6 +1,6 @@
 // Service worker: la app funciona sin conexión y el motor de recorte
 // solo se descarga la primera vez.
-const VERSION = 'vestidor-v1';
+const VERSION = 'vestidor-v2';
 const SHELL = [
   './', './index.html', './styles.css', './manifest.webmanifest',
   './js/app.js', './js/db.js', './js/data.js', './js/color.js', './js/match.js', './js/imaging.js',

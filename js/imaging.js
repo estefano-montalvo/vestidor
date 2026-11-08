@@ -82,7 +82,57 @@ export async function removeBackground(canvas, { quality = 'equilibrado', onProg
   });
   const result = await blobToCanvas(out);
   cleanAlpha(result);
+  keepMainSubject(result);
   return result;
+}
+
+// Elimina los restos sueltos que el recorte deja alrededor (perchas, prendas colgadas detrás…).
+// Conserva la pieza principal y cualquier otra de tamaño parecido (p. ej. el segundo zapato del par).
+export function keepMainSubject(canvas) {
+  const { width: W, height: H } = canvas;
+  const ctx = ctx2d(canvas);
+  const img = ctx.getImageData(0, 0, W, H);
+  const d = img.data;
+  const s = Math.max(1, Math.ceil(Math.max(W, H) / 360));
+  const gw = Math.ceil(W / s), gh = Math.ceil(H / s);
+  const grid = new Uint8Array(gw * gh);
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++)
+      if (d[(y * W + x) * 4 + 3] > 60) grid[((y / s) | 0) * gw + ((x / s) | 0)] = 1;
+
+  const label = new Int32Array(gw * gh);
+  const sizes = [0];
+  const stack = [];
+  let n = 0;
+  for (let i = 0; i < grid.length; i++) {
+    if (!grid[i] || label[i]) continue;
+    n++;
+    let size = 0;
+    label[i] = n;
+    stack.push(i);
+    while (stack.length) {
+      const p = stack.pop();
+      size++;
+      const x = p % gw, y = (p / gw) | 0;
+      if (x > 0 && grid[p - 1] && !label[p - 1]) { label[p - 1] = n; stack.push(p - 1); }
+      if (x < gw - 1 && grid[p + 1] && !label[p + 1]) { label[p + 1] = n; stack.push(p + 1); }
+      if (y > 0 && grid[p - gw] && !label[p - gw]) { label[p - gw] = n; stack.push(p - gw); }
+      if (y < gh - 1 && grid[p + gw] && !label[p + gw]) { label[p + gw] = n; stack.push(p + gw); }
+    }
+    sizes.push(size);
+  }
+  if (n <= 1) return;
+  let main = 1;
+  for (let k = 2; k <= n; k++) if (sizes[k] > sizes[main]) main = k;
+  const keep = new Uint8Array(n + 1);
+  for (let k = 1; k <= n; k++) keep[k] = k === main || sizes[k] > sizes[main] * 0.25 ? 1 : 0;
+
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const l = label[((y / s) | 0) * gw + ((x / s) | 0)];
+      if (!keep[l]) d[(y * W + x) * 4 + 3] = 0;
+    }
+  ctx.putImageData(img, 0, 0);
 }
 
 // Limpia el halo semitransparente que a veces deja el recorte.

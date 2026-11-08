@@ -144,6 +144,7 @@ function renderTab(force = false) {
   view.innerHTML = html;
   if (state.renderedTab !== state.tab) window.scrollTo(0, 0);
   state.renderedTab = state.tab;
+  if (state.tab === 'outfits') requestAnimationFrame(() => positionCarousels(false));
 }
 
 function refresh() {
@@ -238,101 +239,229 @@ function canGenerate() {
   return (has('top') && has('bottom')) || has('pieza');
 }
 
-function regenerate({ remember = true } = {}) {
-  const g = state.gen;
-  if (remember && g.currentIds) g.seen.add(signature(idsToSlots(g.currentIds)));
-  const locks = {};
-  for (const [k, id] of Object.entries(g.locks)) { const it = itemById(id); if (it) locks[k] = it; }
-  const opts = { occasion: g.occasion, season: g.season, withCoat: g.withCoat, locks, prefs: prefs(), avoid: g.seen };
-  let r = generateOutfit(state.items, opts);
-  if (!r && g.seen.size) { g.seen.clear(); r = generateOutfit(state.items, { ...opts, avoid: g.seen }); }
-  g.currentIds = r ? slotsToIds(r.slots) : null;
-  g.savedId = null;
+const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// Prendas de una categoría en orden estable: favoritas primero, luego las más recientes.
+function catItems(cat) {
+  return state.items
+    .filter(i => i.category === cat)
+    .sort((a, b) => (b.favorite ? 1 : 0) - (a.favorite ? 1 : 0) || b.createdAt - a.createdAt);
 }
 
-function viewOutfits() {
+const fitMode = () => (state.gen.currentIds?.pieza ? 'B' : 'A');
+const coatOn = () => state.gen.withCoat && catItems('abrigo').length > 0;
+const layoutKey = () => fitMode() + (coatOn() ? '+abrigo' : '');
+
+function regenerate({ remember = true, mode } = {}) {
   const g = state.gen;
-  const head = `
-  <header class="page-head">
-    <h1 class="display">Outfits</h1>
-    <p class="page-sub">Propuestas hechas con tu propia ropa</p>
-  </header>`;
-
-  if (!canGenerate()) {
-    return head + `
-    <section class="empty">
-      <p>Para proponerte outfits necesito al menos una prenda de arriba y una de abajo, o un vestido.</p>
-      <button class="btn btn-primary" data-action="start-add">${ICON.plus}<span>Añadir prendas</span></button>
-    </section>${lookbookHtml()}`;
+  if (remember && g.currentIds) g.seen.add(signature(idsToSlots(g.currentIds)));
+  const m = mode || (g.currentIds ? fitMode() : null);
+  const pool = state.items.filter(i => i.category !== 'accesorio' &&
+    (m === 'A' ? i.category !== 'pieza' : m === 'B' ? !['top', 'bottom'].includes(i.category) : true));
+  const locks = {};
+  for (const [k, id] of Object.entries(g.locks)) {
+    const it = itemById(id);
+    if (it && pool.includes(it)) locks[k] = it;
   }
+  const opts = { occasion: g.occasion, season: g.season, withCoat: coatOn(), withAccessory: false, locks, prefs: prefs(), avoid: g.seen };
+  let r = generateOutfit(pool, opts);
+  if (!r && g.seen.size) { g.seen.clear(); r = generateOutfit(pool, { ...opts, avoid: g.seen }); }
+  if (r) g.currentIds = slotsToIds(r.slots);
+  g.savedId = null;
+  ensureFitIds();
+}
 
-  if (!g.currentIds) regenerate({ remember: false });
+// Garantiza que cada zona del probador tenga una prenda válida.
+function ensureFitIds() {
+  const g = state.gen;
+  const ids = { ...(g.currentIds || {}) };
+  for (const k of Object.keys(ids)) if (!itemById(ids[k])) delete ids[k];
+  delete ids.accesorio;
+  let mode = ids.pieza ? 'B' : (ids.top || ids.bottom) ? 'A' : null;
+  if (!mode) mode = catItems('top').length && catItems('bottom').length ? 'A' : 'B';
+  const need = mode === 'A' ? ['top', 'bottom', 'calzado'] : ['pieza', 'calzado'];
+  if (mode === 'A') delete ids.pieza; else { delete ids.top; delete ids.bottom; }
+  if (coatOn()) need.push('abrigo'); else delete ids.abrigo;
+  for (const s of need) if (!ids[s]) { const first = catItems(s)[0]; if (first) ids[s] = first.id; }
+  g.currentIds = ids;
+}
+
+function carouselHtml(slot) {
+  const list = catItems(slot);
+  const locked = !!state.gen.locks[slot];
+  if (!list.length) return `<div class="rail"><div class="carousel-empty">Sin ${SLOT_LABEL[slot].toLowerCase()}</div></div>`;
+  return `
+  <div class="rail">
+    <div class="carousel${locked ? ' is-locked' : ''}" data-slot="${slot}" role="group" aria-label="${SLOT_LABEL[slot]}: desliza para cambiar">
+      ${list.map(it => `
+        <div class="slide" data-id="${it.id}">
+          <img class="${it.cutout ? '' : 'is-photo'}" src="${imgUrl(it)}" alt="${esc(it.name)}" draggable="false" decoding="async">
+        </div>`).join('')}
+    </div>
+    ${locked ? `<span class="rail-lock" aria-hidden="true">${ICON.lock}</span>` : ''}
+    ${list.length > 1 && !locked ? `
+      <button class="rail-arrow prev" data-action="swipe" data-slot="${slot}" data-dir="-1" aria-label="${SLOT_LABEL[slot]} anterior">${ICON.back}</button>
+      <button class="rail-arrow next" data-action="swipe" data-slot="${slot}" data-dir="1" aria-label="${SLOT_LABEL[slot]} siguiente">${ICON.back}</button>` : ''}
+  </div>`;
+}
+
+function fittingHtml() {
+  const coat = coatOn();
+  const rows = fitMode() === 'A'
+    ? [['upper', coat ? ['abrigo', 'top'] : ['top']], ['lower', ['bottom']], ['feet', ['calzado']]]
+    : [['dress', coat ? ['abrigo', 'pieza'] : ['pieza']], ['feet', ['calzado']]];
+  return `
+  <div class="fitting">
+    ${rows.map(([band, slots]) => `
+      <div class="band band-${band}${slots.length > 1 ? ' is-split' : ''}">${slots.map(carouselHtml).join('')}</div>`).join('')}
+  </div>`;
+}
+
+function fitSideHtml() {
+  const g = state.gen;
   const slots = idsToSlots(g.currentIds);
   const info = outfitScore(slots, prefs());
   const saved = g.savedId ? state.outfits.find(o => o.id === g.savedId) : null;
-  const viewingSaved = !!saved;
   const alreadySaved = !saved && state.outfits.find(o => signature(idsToSlots(o.slots)) === signature(slots));
-
-  const controls = viewingSaved ? `
-    <div class="saved-banner">
-      <button class="btn btn-ghost" data-action="back-to-gen">${ICON.back}<span>Volver a las propuestas</span></button>
-    </div>` : `
-    <div class="gen-controls">
-      <div class="chips scroll-x" role="group" aria-label="Ocasión">
-        <button class="chip" data-action="occasion" data-v="cualquiera" aria-pressed="${g.occasion === 'cualquiera'}">Cualquier ocasión</button>
-        ${STYLES.map(s => `<button class="chip" data-action="occasion" data-v="${s.id}" aria-pressed="${g.occasion === s.id}">${s.label}</button>`).join('')}
-      </div>
-      <div class="gen-row">
-        <div class="seg" role="group" aria-label="Temporada">
-          ${SEASONS.map(s => `<button data-action="season" data-v="${s.id}" aria-pressed="${g.season === s.id}">${s.label}</button>`).join('')}
-        </div>
-        <label class="switch">
-          <input type="checkbox" data-change="toggle-coat" ${g.withCoat ? 'checked' : ''}>
-          <span class="switch-ui" aria-hidden="true"></span><span>Con abrigo</span>
-        </label>
-      </div>
-    </div>`;
-
-  const shownSlots = SLOT_ORDER.filter(s => slots[s] || (!viewingSaved && OPTIONAL_SLOTS.includes(s) && state.items.some(i => i.category === s) && !(s === 'abrigo' && !g.withCoat)));
+  const shown = SLOT_ORDER.filter(s => slots[s]);
 
   const strip = `
     <ul class="slot-strip">
-      ${shownSlots.map(s => {
+      ${shown.map(s => {
         const it = slots[s];
         const locked = !!g.locks[s];
         return `
         <li class="slot">
-          <button class="slot-pick" data-action="pick" data-slot="${s}" aria-label="Cambiar ${SLOT_LABEL[s].toLowerCase()}">
-            <span class="studio slot-thumb${it && !it.cutout ? ' is-photo' : ''}">${it ? `<img src="${imgUrl(it)}" alt="">` : ICON.plus}</span>
-            <span class="slot-text"><span class="slot-label">${SLOT_LABEL[s]}</span><span class="slot-name">${it ? esc(it.name) : 'Sin elegir'}</span></span>
+          <button class="slot-pick" data-action="pick" data-slot="${s}" aria-label="Elegir ${SLOT_LABEL[s].toLowerCase()} de la lista">
+            <span class="studio slot-thumb${it.cutout ? '' : ' is-photo'}"><img src="${imgUrl(it)}" alt=""></span>
+            <span class="slot-text"><span class="slot-label">${SLOT_LABEL[s]}</span><span class="slot-name">${esc(it.name)}</span></span>
           </button>
-          ${!viewingSaved && it ? `<button class="icon-btn${locked ? ' is-on' : ''}" data-action="lock" data-slot="${s}" aria-pressed="${locked}" aria-label="${locked ? 'Soltar' : 'Fijar'} ${SLOT_LABEL[s].toLowerCase()}">${locked ? ICON.lock : ICON.unlock}</button>` : ''}
+          <button class="icon-btn${locked ? ' is-on' : ''}" data-action="lock" data-slot="${s}" aria-pressed="${locked}" aria-label="${locked ? 'Soltar' : 'Fijar'} ${SLOT_LABEL[s].toLowerCase()}">${locked ? ICON.lock : ICON.unlock}</button>
         </li>`;
       }).join('')}
     </ul>`;
 
-  const actions = viewingSaved ? `
+  const actions = saved ? `
     <div class="gen-actions">
       <button class="btn btn-primary" data-action="wear" data-id="${saved.id}">${ICON.check}<span>Me lo he puesto hoy</span></button>
       <button class="btn btn-ghost danger" data-action="delete-outfit" data-id="${saved.id}">${ICON.trash}<span>Eliminar</span></button>
     </div>
     <p class="fineprint">${saved.wears ? `Te lo has puesto ${plural(saved.wears, 'vez', 'veces')}.` : 'Todavía no te lo has puesto.'}</p>` : `
     <div class="gen-actions">
-      <button class="btn btn-primary" data-action="next">${ICON.shuffle}<span>Otra propuesta</span></button>
+      <button class="btn btn-primary" data-action="next">${ICON.shuffle}<span>Sugerir otra</span></button>
       <button class="btn btn-ghost" data-action="save-outfit" ${alreadySaved ? 'disabled' : ''}>${ICON.bookmark}<span>${alreadySaved ? 'Guardado' : 'Guardar'}</span></button>
       <button class="icon-btn" data-action="dislike" aria-label="No me convence" title="No me convence">${ICON.thumbDown}</button>
     </div>`;
 
-  return head + controls + `
-  <section class="stage-wrap">
-    ${stageHtml(slots)}
-    <div class="gen-side">
-      <div class="verdict">
-        <p class="verdict-label">${info.label} <span class="verdict-score">${info.score}/100</span></p>
-        <p class="verdict-reason">${esc(info.reason)}.</p>
+  return `
+    ${saved ? `<p class="saved-tag">Outfit guardado</p>` : ''}
+    <div class="verdict">
+      <p class="verdict-label">${info.label} <span class="verdict-score">${info.score}/100</span></p>
+      <p class="verdict-reason">${esc(info.reason)}.</p>
+    </div>
+    ${strip}
+    ${actions}`;
+}
+
+function updateFitSide() {
+  const side = $('#fit-side');
+  if (side) side.innerHTML = fitSideHtml();
+}
+
+// Coloca cada carrusel en la prenda actual (con animación si se pide).
+function positionCarousels(smooth = false) {
+  document.querySelectorAll('.carousel').forEach(c => {
+    const id = state.gen.currentIds?.[c.dataset.slot];
+    const idx = Math.max(0, [...c.children].findIndex(sl => sl.dataset.id === id));
+    const left = idx * c.clientWidth;
+    if (Math.abs(c.scrollLeft - left) > 2) c.scrollTo({ left, behavior: smooth && !reducedMotion() ? 'smooth' : 'auto' });
+  });
+}
+
+function onCarouselSettle(c) {
+  if (!c.isConnected || !c.clientWidth) return;
+  const idx = Math.round(c.scrollLeft / c.clientWidth);
+  const slide = c.children[idx];
+  if (!slide) return;
+  const g = state.gen;
+  const slot = c.dataset.slot;
+  if (g.currentIds?.[slot] === slide.dataset.id) return;
+  g.currentIds = { ...(g.currentIds || {}), [slot]: slide.dataset.id };
+  if (g.savedId) { g.savedId = null; }
+  updateFitSide();
+}
+
+function applySuggestion(prevKey) {
+  if (state.tab === 'outfits' && layoutKey() === prevKey && $('.fitting')) {
+    updateFitSide();
+    positionCarousels(true);
+  } else {
+    renderTab(true);
+  }
+}
+
+function viewOutfits() {
+  const g = state.gen;
+  const head = `
+  <header class="page-head compact">
+    <h1 class="display">Probador</h1>
+    <p class="page-sub">Desliza cada prenda para combinar</p>
+  </header>`;
+
+  if (!canGenerate()) {
+    return head + `
+    <section class="empty">
+      <p>Para usar el probador necesito al menos una prenda de arriba y una de abajo, o un vestido. Revisa también que cada prenda tenga bien puesta su categoría.</p>
+      <button class="btn btn-primary" data-action="start-add">${ICON.plus}<span>Añadir prendas</span></button>
+    </section>${lookbookHtml()}`;
+  }
+
+  if (!g.currentIds) regenerate({ remember: false, mode: catItems('top').length && catItems('bottom').length ? 'A' : 'B' });
+  else ensureFitIds();
+
+  const hasSeparates = catItems('top').length && catItems('bottom').length;
+  const hasDresses = catItems('pieza').length;
+  const hasCoats = catItems('abrigo').length;
+  const mode = fitMode();
+
+  const controls = (hasSeparates && hasDresses) || hasCoats ? `
+    <div class="fit-controls">
+      ${hasSeparates && hasDresses ? `
+      <div class="seg" role="group" aria-label="Tipo de conjunto">
+        <button data-action="fit-mode" data-v="A" aria-pressed="${mode === 'A'}">Por piezas</button>
+        <button data-action="fit-mode" data-v="B" aria-pressed="${mode === 'B'}">Vestido</button>
+      </div>` : ''}
+      ${hasCoats ? `
+      <label class="switch">
+        <input type="checkbox" data-change="toggle-coat" ${g.withCoat ? 'checked' : ''}>
+        <span class="switch-ui" aria-hidden="true"></span><span>Con abrigo</span>
+      </label>` : ''}
+    </div>` : '';
+
+  const tune = `
+    <details class="tune"${g.tuneOpen ? ' open' : ''}>
+      <summary>Ajustar las sugerencias</summary>
+      <div class="tune-body">
+        <div class="chips wrap" role="group" aria-label="Ocasión">
+          <button class="chip" data-action="occasion" data-v="cualquiera" aria-pressed="${g.occasion === 'cualquiera'}">Cualquier ocasión</button>
+          ${STYLES.map(s => `<button class="chip" data-action="occasion" data-v="${s.id}" aria-pressed="${g.occasion === s.id}">${s.label}</button>`).join('')}
+        </div>
+        <div class="seg" role="group" aria-label="Temporada">
+          ${SEASONS.map(s => `<button data-action="season" data-v="${s.id}" aria-pressed="${g.season === s.id}">${s.label}</button>`).join('')}
+        </div>
+        <p class="fineprint">Se aplican cuando pulsas «Sugerir otra». Deslizando puedes probar cualquier prenda.</p>
       </div>
-      ${strip}
-      ${actions}
+    </details>`;
+
+  return head + controls + `
+  <section class="fit-wrap">
+    <div class="fit-col">
+      ${fittingHtml()}
+      <p class="fineprint fit-hint">Desliza cada zona a los lados para cambiar de prenda. Toca un nombre de la lista para verlas ordenadas de mejor a peor.</p>
+    </div>
+    <div class="fit-side-col">
+      <div id="fit-side">${fitSideHtml()}</div>
+      ${tune}
     </div>
   </section>
   ${lookbookHtml()}`;
@@ -553,28 +682,29 @@ function autoName(form) {
 }
 
 function formHtml(form) {
-  const cat = catById(form.category);
+  const cat = form.category ? catById(form.category) : null;
   const allSeasons = form.seasons.length === 4;
   return `
   <div class="form">
-    <label class="field">
-      <span class="field-label">Nombre</span>
-      <input type="text" data-input="name" value="${esc(form.name)}" placeholder="${esc(autoName(form))}" autocomplete="off" enterkeyhint="done">
-    </label>
-
     <fieldset class="field">
-      <legend class="field-label">Categoría</legend>
+      <legend class="field-label">Categoría${cat ? '' : ' <span class="field-required">elige una</span>'}</legend>
       <div class="chips wrap">
         ${CATEGORIES.map(c => `<button type="button" class="chip" data-action="f-cat" data-v="${c.id}" aria-pressed="${form.category === c.id}">${c.label}</button>`).join('')}
       </div>
     </fieldset>
 
+    ${cat ? `
     <fieldset class="field">
       <legend class="field-label">Tipo</legend>
       <div class="chips wrap">
         ${cat.types.map(t => `<button type="button" class="chip" data-action="f-type" data-v="${esc(t)}" aria-pressed="${form.type === t}">${t}</button>`).join('')}
       </div>
-    </fieldset>
+    </fieldset>` : ''}
+
+    <label class="field">
+      <span class="field-label">Nombre</span>
+      <input type="text" data-input="name" value="${esc(form.name)}" placeholder="${esc(autoName(form))}" autocomplete="off" enterkeyhint="done">
+    </label>
 
     <fieldset class="field">
       <legend class="field-label">Color <span class="field-value">${colorById(form.color).name}${form.detected && form.detected === form.color ? ' (detectado)' : ''}</span></legend>
@@ -664,7 +794,7 @@ function sheetAdd() {
   </div>
   <footer class="sheet-foot">
     <button class="btn btn-ghost" data-action="add-skip">${more ? 'Saltar' : 'Descartar'}</button>
-    <button class="btn btn-primary" data-action="add-save">${more ? 'Guardar y seguir' : 'Guardar prenda'}</button>
+    <button class="btn btn-primary" data-action="add-save" ${cur.form.category ? '' : 'disabled'}>${!cur.form.category ? 'Elige una categoría' : more ? 'Guardar y seguir' : 'Guardar prenda'}</button>
   </footer>`;
 }
 
@@ -707,7 +837,7 @@ function sheetPicker(slot) {
           </button>
         </li>`).join('')}
     </ul>` : `<p class="empty-inline">No tienes prendas en esta categoría.</p>`}
-    <p class="fineprint">La prenda que elijas queda fijada para las siguientes propuestas.</p>
+    <p class="fineprint">Ordenadas de mejor a peor según lo que llevas puesto.</p>
   </div>`;
 }
 
@@ -715,7 +845,7 @@ function sheetPicker(slot) {
 
 function defaultForm(colorEntry) {
   return {
-    name: '', category: 'top', type: 'Camiseta', color: colorEntry.id, detected: colorEntry.id, colorAuto: true,
+    name: '', category: null, type: null, color: colorEntry.id, detected: colorEntry.id, colorAuto: true,
     pattern: false, styles: ['casual'], seasons: [...ALL_SEASONS],
   };
 }
@@ -804,6 +934,7 @@ async function saveAdd() {
   const a = state.add;
   const cur = a.current;
   const f = cur.form;
+  if (!f.category) { toast('Elige primero la categoría de la prenda'); return; }
   const item = {
     id: uid(), createdAt: Date.now(),
     name: f.name.trim() || autoName(f),
@@ -941,15 +1072,32 @@ const actions = {
     g.locks = { [it.category]: it.id };
     if (it.category === 'abrigo') g.withCoat = true;
     g.seen.clear();
-    regenerate({ remember: false });
+    const mode = it.category === 'pieza' ? 'B' : ['top', 'bottom'].includes(it.category) ? 'A' : undefined;
+    regenerate({ remember: false, mode });
     state.renderedTab = null;
     state.sheet = null;
     location.hash = 'outfits';
   },
 
-  'occasion': el => { state.gen.occasion = el.dataset.v; state.gen.seen.clear(); regenerate({ remember: false }); renderTab(true); },
-  'season': el => { state.gen.season = el.dataset.v; state.gen.seen.clear(); regenerate({ remember: false }); renderTab(true); },
-  'next': () => { regenerate(); renderTab(true); },
+  'occasion': el => { state.gen.occasion = el.dataset.v; state.gen.seen.clear(); renderTab(true); },
+  'season': el => { state.gen.season = el.dataset.v; state.gen.seen.clear(); renderTab(true); },
+  'next': () => { const before = layoutKey(); regenerate(); applySuggestion(before); },
+  'swipe': el => {
+    const c = $(`.carousel[data-slot="${el.dataset.slot}"]`);
+    if (!c) return;
+    const n = c.children.length;
+    let next = Math.round(c.scrollLeft / c.clientWidth) + Number(el.dataset.dir);
+    if (next < 0) next = n - 1;
+    if (next >= n) next = 0;
+    c.scrollTo({ left: next * c.clientWidth, behavior: reducedMotion() ? 'auto' : 'smooth' });
+  },
+  'fit-mode': el => {
+    const g = state.gen; const v = el.dataset.v;
+    if (fitMode() === v) return;
+    if (v === 'B') { delete g.locks.top; delete g.locks.bottom; } else delete g.locks.pieza;
+    regenerate({ remember: false, mode: v });
+    renderTab(true);
+  },
   'lock': el => {
     const g = state.gen; const s = el.dataset.slot;
     if (g.locks[s]) delete g.locks[s];
@@ -963,7 +1111,6 @@ const actions = {
     if (s === 'pieza') { delete ids.top; delete ids.bottom; delete g.locks.top; delete g.locks.bottom; }
     if (s === 'top' || s === 'bottom') { delete ids.pieza; delete g.locks.pieza; }
     if (s === 'abrigo') g.withCoat = true;
-    g.locks[s] = el.dataset.id;
     g.currentIds = ids;
     g.savedId = null;
     state.renderedTab = null;
@@ -993,14 +1140,16 @@ const actions = {
         state.dislikes[k] = (state.dislikes[k] || 0) + 1;
       }
     await persistDislikes();
+    const before = layoutKey();
     regenerate();
-    renderTab(true);
+    applySuggestion(before);
     toast('Anotado, te propondré otras cosas');
   },
   'open-saved': el => {
     const o = state.outfits.find(x => x.id === el.dataset.id);
     state.gen.savedId = o.id;
     state.gen.currentIds = { ...o.slots };
+    state.gen.withCoat = !!o.slots.abrigo;
     renderTab(true);
     window.scrollTo({ top: 0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' });
   },
@@ -1038,7 +1187,24 @@ const actions = {
 };
 
 const changeActions = {
-  'toggle-coat': el => { state.gen.withCoat = el.checked; state.gen.seen.clear(); regenerate({ remember: false }); renderTab(true); },
+  'toggle-coat': el => {
+    const g = state.gen;
+    g.withCoat = el.checked;
+    if (g.withCoat) {
+      // Elige el abrigo que mejor combina con lo que ya llevas puesto.
+      const base = idsToSlots(g.currentIds);
+      let best = null, bestScore = -1;
+      for (const c of catItems('abrigo')) {
+        const sc = outfitScore({ ...base, abrigo: c }, prefs()).score;
+        if (sc > bestScore) { bestScore = sc; best = c; }
+      }
+      if (best) g.currentIds = { ...g.currentIds, abrigo: best.id };
+    } else {
+      delete g.locks.abrigo;
+    }
+    g.savedId = null;
+    renderTab(true);
+  },
   'toggle-autocut': async el => { state.settings.autoCut = el.checked; await persistSettings(); },
   'f-pattern': el => { activeForm().pattern = el.checked; },
 };
@@ -1131,6 +1297,24 @@ $('#file-import').addEventListener('change', e => {
 });
 
 window.addEventListener('hashchange', route);
+
+const settleTimers = new WeakMap();
+document.addEventListener('scroll', e => {
+  const c = e.target;
+  if (!(c instanceof Element) || !c.classList.contains('carousel')) return;
+  clearTimeout(settleTimers.get(c));
+  settleTimers.set(c, setTimeout(() => onCarouselSettle(c), 120));
+}, true);
+
+document.addEventListener('toggle', e => {
+  if (e.target.classList?.contains('tune')) state.gen.tuneOpen = e.target.open;
+}, true);
+
+let resizeTimer;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { if (state.tab === 'outfits') positionCarousels(false); }, 150);
+});
 
 /* ---------- arranque ---------- */
 
